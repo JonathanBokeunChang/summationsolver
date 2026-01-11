@@ -1,234 +1,453 @@
+import math
 import sympy as sp
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    convert_xor,
+    implicit_multiplication_application,
+    function_exponentiation,
+)
 
 # Define the symbol 'n' as a positive integer (for proper series behavior)
 n = sp.symbols('n', positive=True, integer=True)
+
+PARSER_TRANSFORMATIONS = standard_transformations + (
+    convert_xor,
+    implicit_multiplication_application,
+    function_exponentiation,
+)
+PARSER_LOCALS = {
+    'n': n,
+    'arctan': sp.atan,
+    'atan': sp.atan,
+    'arcsin': sp.asin,
+    'asin': sp.asin,
+    'arccos': sp.acos,
+    'acos': sp.acos,
+    'ln': sp.log,
+    'log': sp.log,
+    'sqrt': sp.sqrt,
+    'exp': sp.exp,
+    'abs': sp.Abs,
+    'Abs': sp.Abs,
+    'sin': sp.sin,
+    'cos': sp.cos,
+    'tan': sp.tan,
+    'sec': sp.sec,
+    'csc': sp.csc,
+    'cot': sp.cot,
+    'sinh': sp.sinh,
+    'cosh': sp.cosh,
+    'tanh': sp.tanh,
+    'pi': sp.pi,
+    'e': sp.E,
+    'E': sp.E,
+}
+
+def _parse_series_expression(expr_str):
+    expr_str = expr_str.strip()
+    if not expr_str:
+        raise ValueError("Empty expression")
+    return parse_expr(
+        expr_str,
+        local_dict=PARSER_LOCALS,
+        transformations=PARSER_TRANSFORMATIONS,
+    )
+
+def _safe_limit(expr):
+    try:
+        limit_expr = sp.limit(expr, n, sp.oo)
+    except Exception:
+        return None
+    if isinstance(limit_expr, sp.Limit):
+        try:
+            limit_expr = limit_expr.doit()
+        except Exception:
+            return None
+    if isinstance(limit_expr, sp.Limit):
+        return None
+    return limit_expr
+
+def _limit_is_zero(expr):
+    limit_expr = _safe_limit(expr)
+    if limit_expr is None:
+        return None
+    if limit_expr in (sp.oo, -sp.oo, sp.zoo, sp.nan):
+        return False
+    if isinstance(limit_expr, sp.AccumBounds):
+        return False
+    if limit_expr.is_number and limit_expr.is_real:
+        return limit_expr.is_zero
+    return None
+
+def _finite_nonzero_real_limit(expr):
+    limit_expr = _safe_limit(expr)
+    if limit_expr is None:
+        return None
+    if limit_expr in (sp.oo, -sp.oo, sp.zoo, sp.nan):
+        return None
+    if isinstance(limit_expr, sp.AccumBounds):
+        return None
+    if limit_expr.is_number and limit_expr.is_real:
+        if limit_expr.is_zero:
+            return None
+        return limit_expr
+    try:
+        limit_val = float(limit_expr)
+    except Exception:
+        return None
+    if math.isfinite(limit_val) and limit_val != 0.0:
+        return limit_expr
+    return None
+
+def _compare_to_minus_one(value):
+    if value is None:
+        return None
+    if not (value.is_number and value.is_real):
+        return None
+    diff = sp.simplify(value + 1)
+    if diff.is_zero:
+        return 0
+    if diff.is_positive:
+        return 1
+    if diff.is_negative:
+        return -1
+    return None
+
+def _is_linear_in_n(expr):
+    try:
+        poly = sp.Poly(expr, n)
+    except Exception:
+        return False
+    if poly is None or poly.total_degree() != 1:
+        return False
+    coeffs = poly.all_coeffs()
+    if len(coeffs) != 2:
+        return False
+    return coeffs[0] != 0
+
+def _is_eventually_decreasing(expr, start=2):
+    interval = sp.Interval.Lopen(start, sp.oo)
+    try:
+        monotonic = sp.is_monotonic(expr, interval, n)
+    except NotImplementedError:
+        monotonic = None
+    if monotonic is True:
+        return True
+    try:
+        d_expr = sp.diff(expr, n)
+        d_val = sp.simplify(d_expr.subs(n, start + 1))
+        if d_val.is_real and d_val.is_number:
+            if d_val < 0:
+                return True
+            if d_val > 0:
+                return False
+    except Exception:
+        pass
+    try:
+        v1 = sp.simplify(expr.subs(n, start + 1))
+        v2 = sp.simplify(expr.subs(n, start + 2))
+        if v1.is_real and v2.is_real:
+            diff = sp.simplify(v1 - v2)
+            if diff.is_real and diff.is_number:
+                if diff > 0:
+                    return True
+                if diff < 0:
+                    return False
+            diff_val = float(diff)
+            if diff_val > 0:
+                return True
+            if diff_val < 0:
+                return False
+    except Exception:
+        pass
+    return None
+
+def _split_alternating_factor(expr):
+    alt_factor = None
+    for pow_expr in expr.atoms(sp.Pow):
+        if pow_expr.base == -1 and pow_expr.exp.has(n):
+            alt_factor = pow_expr
+            break
+    if alt_factor is None and expr.has(sp.cos):
+        replacements = {
+            sp.cos(sp.pi * n): (-1) ** n,
+            sp.cos(sp.pi * (n + 1)): (-1) ** (n + 1),
+            sp.cos(sp.pi * n + sp.pi): (-1) ** (n + 1),
+        }
+        expr = expr.xreplace(replacements)
+        for pow_expr in expr.atoms(sp.Pow):
+            if pow_expr.base == -1 and pow_expr.exp.has(n):
+                alt_factor = pow_expr
+                break
+    if alt_factor is None:
+        return None, expr
+    return alt_factor, sp.simplify(expr / alt_factor)
+
+def _split_linear_oscillation(expr):
+    for factor in expr.as_ordered_factors():
+        if factor.func in (sp.sin, sp.cos):
+            arg = factor.args[0]
+            if _is_linear_in_n(arg):
+                return factor, sp.simplify(expr / factor)
+    return None, expr
+
+def _extract_power_log_exponents(expr, max_log_depth=3):
+    expr = sp.simplify(expr)
+    powers = expr.as_powers_dict()
+    bases = [n]
+    log_base = sp.log(n)
+    for _ in range(max_log_depth):
+        bases.append(log_base)
+        log_base = sp.log(log_base)
+    exponents = []
+    for base in bases:
+        exp = powers.get(base, 0)
+        if exp is None:
+            exp = 0
+        exp = sp.sympify(exp)
+        if not (exp.is_number and exp.is_real):
+            return None
+        exponents.append(sp.simplify(exp))
+        expr = sp.simplify(expr / (base ** exp))
+    return exponents, expr
+
+def _leading_series_term(expr, order=4):
+    """Return a simplified leading term for expr as n->∞ using asymptotic series."""
+    try:
+        series_expr = sp.series(expr, n, sp.oo, order)
+    except Exception:
+        return None
+    try:
+        principal = series_expr.removeO()
+    except Exception:
+        return None
+    terms = principal.as_ordered_terms()
+    if not terms:
+        return None
+    leading = sp.simplify(terms[0])
+    return None if leading is sp.nan else leading
+
+def _power_log_test(a_n):
+    for candidate in (a_n, _leading_series_term(a_n)):
+        extracted = _extract_power_log_exponents(candidate) if candidate is not None else None
+        if extracted is None:
+            continue
+        exponents, other = extracted
+        other_limit = _finite_nonzero_real_limit(other)
+        if other_limit is None:
+            continue
+        p_cmp = _compare_to_minus_one(exponents[0])
+        if p_cmp is None:
+            continue
+        if p_cmp < 0:
+            return "Convergent (by limit comparison to p-series; absolute)"
+        if p_cmp > 0:
+            return "Divergent (by limit comparison to p-series)"
+        for exponent in exponents[1:]:
+            log_cmp = _compare_to_minus_one(exponent)
+            if log_cmp is None:
+                break
+            if log_cmp < 0:
+                return "Convergent (by limit comparison to logarithmic p-series; absolute)"
+            if log_cmp > 0:
+                return "Divergent (by limit comparison to logarithmic p-series)"
+        else:
+            return "Divergent (by limit comparison to logarithmic p-series)"
+    return None
+
+def _ratio_test(a_n):
+    try:
+        ratio_expr = sp.Abs(a_n.subs(n, n + 1) / a_n)
+    except Exception:
+        return None
+    L = _safe_limit(ratio_expr)
+    if L is None:
+        return None
+    if L in (sp.oo, -sp.oo, sp.zoo):
+        return "Divergent (by Ratio Test; limit L -> ∞ > 1)"
+    if isinstance(L, sp.AccumBounds) or L is sp.nan:
+        return None
+    if L.is_number and L.is_real:
+        if L < 1:
+            return f"Convergent (Absolutely convergent by Ratio Test; L = {float(L):.6g} < 1)"
+        if L > 1:
+            return f"Divergent (by Ratio Test; L = {float(L):.6g} > 1)"
+    return None
+
+def _root_test(a_n):
+    try:
+        root_expr = sp.Abs(a_n) ** (1 / n)
+    except Exception:
+        return None
+    R = _safe_limit(root_expr)
+    if R is None:
+        return None
+    if R in (sp.oo, -sp.oo, sp.zoo):
+        return "Divergent (by Root Test; limit -> ∞ > 1)"
+    if isinstance(R, sp.AccumBounds) or R is sp.nan:
+        return None
+    if R.is_number and R.is_real:
+        if R < 1:
+            return f"Convergent (Absolutely convergent by Root Test; limit = {float(R):.6g} < 1)"
+        if R > 1:
+            return f"Divergent (by Root Test; limit = {float(R):.6g} > 1)"
+    return None
+
+def _log_order_absolute_test(a_n):
+    try:
+        log_ratio = sp.log(sp.Abs(a_n)) / sp.log(n)
+    except Exception:
+        return None
+    p = _safe_limit(log_ratio)
+    if p is None:
+        return None
+    if p == -sp.oo:
+        return "Convergent (Absolutely convergent; faster than any power)"
+    if p in (sp.oo, -sp.oo, sp.zoo):
+        return None
+    if isinstance(p, sp.AccumBounds) or p is sp.nan:
+        return None
+    if p.is_number and p.is_real:
+        cmp_val = _compare_to_minus_one(p)
+        if cmp_val is not None and cmp_val < 0:
+            return "Convergent (Absolutely convergent by power comparison)"
+    return None
+
+def _limit_power_comparison(a_n):
+    abs_expr = sp.simplify(sp.Abs(a_n))
+    candidate_powers = [sp.Rational(p, 2) for p in range(1, 13)]  # 0.5 to 6
+    for p in candidate_powers:
+        limit_val = _finite_nonzero_real_limit(abs_expr * (n ** p))
+        if limit_val is None:
+            continue
+        if p > 1:
+            return f"Convergent (by limit comparison to 1/n^{float(p):.3g}; absolute)"
+        if p == 1:
+            return "Divergent (by limit comparison to harmonic series)"
+        if p < 1:
+            return "Divergent (terms comparable to 1/n^p with p ≤ 1)"
+    return None
+
+def _rational_function_test(a_n):
+    if not a_n.is_rational_function(n):
+        return None
+    num, den = a_n.as_numer_denom()
+    deg_num = sp.degree(num, n)
+    deg_den = sp.degree(den, n)
+    if deg_num is None or deg_den is None:
+        return None
+    diff = deg_den - deg_num
+    if diff > 1:
+        return "Convergent (by comparison to p-series; rational function)"
+    if diff == 1:
+        limit_val = _finite_nonzero_real_limit(a_n * n)
+        if limit_val is not None:
+            return "Divergent (by limit comparison to harmonic series)"
+    return None
+
+def _integral_test_absolute(a_n):
+    abs_expr = sp.simplify(sp.Abs(a_n))
+    monotone = _is_eventually_decreasing(abs_expr)
+    if monotone is not True:
+        return None
+    try:
+        integral = sp.integrate(abs_expr, (n, 1, sp.oo))
+    except Exception:
+        return None
+    if isinstance(integral, sp.Integral):
+        return None
+    if integral in (sp.oo, -sp.oo, sp.zoo):
+        return None
+    return "Convergent (Absolutely convergent by Integral Test)"
+
+def _alternating_test(a_n):
+    alt_factor, rest = _split_alternating_factor(a_n)
+    if alt_factor is None:
+        return None
+    if rest.has(sp.sin) or rest.has(sp.cos):
+        return None
+    b_n = sp.simplify(sp.Abs(rest))
+    limit_zero = _limit_is_zero(b_n)
+    if limit_zero is not True:
+        return None
+    monotone = _is_eventually_decreasing(b_n)
+    if monotone is True:
+        return "Convergent (Conditionally convergent by Alternating Series Test)"
+    return None
+
+def _dirichlet_test(a_n):
+    osc_factor, rest = _split_linear_oscillation(a_n)
+    if osc_factor is None:
+        return None
+    b_n = sp.simplify(sp.Abs(rest))
+    limit_zero = _limit_is_zero(b_n)
+    if limit_zero is not True:
+        return None
+    monotone = _is_eventually_decreasing(b_n)
+    if monotone is True:
+        return "Convergent (by Dirichlet's Test; oscillatory terms with decreasing amplitude)"
+    return None
 
 def analyze_series(expr_str):
     """Analyze convergence of the series Σ a_n from n=1 to ∞, given a_n expression as a string."""
     # Parse the input expression string into a Sympy expression
     try:
-        a_n = sp.sympify(expr_str, locals={'n': n})
+        a_n = _parse_series_expression(expr_str)
     except Exception as e:
         return f"Invalid expression: {e}"
     
+    a_n = sp.simplify(a_n)
+    if a_n.is_zero:
+        return "Convergent (series is identically 0)"
+
     # 1. n-th Term Test for Divergence
-    try:
-        term_limit = sp.limit(a_n, n, sp.oo)  # limit as n -> infinity
-    except Exception as e:
-        term_limit = None
-    if term_limit is None:
-        # If Sympy couldn't compute the limit, try a different approach or mark as undetermined for now
-        term_limit_value = None
-    else:
-        # If the limit is a sympy NaN (not a number, e.g. oscillatory) or infinity, treat appropriately
-        if term_limit is sp.nan:
+    term_limit = _safe_limit(a_n)
+    if term_limit is not None:
+        if term_limit in (sp.oo, -sp.oo, sp.zoo):
+            return "Divergent (n-th term -> ∞, does not approach 0)"
+        if term_limit is sp.nan or isinstance(term_limit, sp.AccumBounds):
             return "Divergent (n-th term does not approach a single value)"
-        if term_limit is sp.oo or term_limit is -sp.oo:
-            return "Divergent (n-th term → ∞, does not approach 0)"
-        # If we get a finite value, check if it's zero
-        try:
-            term_limit_value = float(term_limit)  # numerical value if possible
-        except Exception:
-            term_limit_value = term_limit  # if symbolic (like 1/2 or 0), use it directly
-    # If the limit exists and is not zero, series diverges
-    if term_limit_value not in (0, None):
-        # e.g., limit = c != 0
-        return f"Divergent (n-th term → {term_limit_value}, not 0)"
-    
-    # At this point, either limit is 0 or not determined. If not 0, we've returned.
-    # We proceed with other tests for convergence.
-    
-    # 2. Check for alternating series form (-1)^n or similar.
-    is_alternating = False
-    # Detect factor of (-1)^n (or (-1)^(n+k))
-    for factor in a_n.args:
-        # Check if any factor is (-1)**something involving n
-        if isinstance(factor, sp.Pow) and factor.base == -1:
-            if factor.exp.has(n):
-                is_alternating = True
-                break
-    # Also detect cos(n*pi) pattern, which equals (-1)^n for integer n
-    if not is_alternating and a_n.has(sp.cos):
-        # Replace cos(n*pi) with (-1)**n, cos(n*pi + pi) with (-1)**(n+1) etc.
-        a_n_alt = a_n.xreplace({sp.cos(n*sp.pi): (-1)**n,
-                                 sp.cos(n*sp.pi + sp.pi): (-1)**(n+1)})
-        if a_n_alt != a_n:
-            a_n = a_n_alt
-            # If replacement happened, it's alternating
-            is_alternating = True
-    
-    # If the series is alternating, check absolute convergence first
-    if is_alternating:
-        # Consider b_n = |a_n| for absolute convergence tests
-        a_n_abs = sp.simplify(sp.Abs(a_n))
-        
-        # 2a. Test absolute convergence (apply Ratio or Integral/P-Series on |a_n|)
-        abs_conv = None  # will be set to True/False if determined
-        # Ratio test on |a_n|
-        try:
-            abs_ratio = sp.limit(a_n_abs.subs(n, n+1) / a_n_abs, n, sp.oo)
-        except Exception:
-            abs_ratio = None
-        if abs_ratio is not None:
-            if abs_ratio is sp.oo:
-                abs_conv = False
-            elif abs_ratio.is_real:
-                try:
-                    abs_ratio_val = float(abs_ratio)
-                except Exception:
-                    abs_ratio_val = abs_ratio  # could be 1 or symbolic
-                if abs_ratio_val < 1:
-                    return f"Convergent (Absolutely convergent by Ratio Test; L = {abs_ratio_val:.3f} < 1)"
-                elif abs_ratio_val > 1:
-                    abs_conv = False
-                else:
-                    abs_conv = None
-        
-        # If ratio test inconclusive, try Integral test (for positive terms of |a_n|)
-        if abs_conv is None:
-            try:
-                abs_integral = sp.integrate(a_n_abs, (n, 1, sp.oo))
-            except Exception:
-                abs_integral = None
-            if abs_integral is sp.oo:
-                abs_conv = False
-            elif abs_integral is not None:
-                abs_conv = True  # got a finite value for the integral
-            # Alternatively, we could attempt p-series analysis here for |a_n|
-        
-        if abs_conv:
-            # Absolutely convergent series
-            return "Convergent (Absolutely convergent; series of |a_n| converges)"
-        
-        # 2b. If not absolutely convergent, apply Alternating Series Test for conditional convergence
-        # Check if the positive part b_n = |a_n| is eventually decreasing and tends to 0
-        # We already know limit -> 0 from earlier (term_limit_value == 0 in this branch)
-        # For monotonic decrease, we'll do a simple heuristic check
-        monotonic = None
-        try:
-            # Check sign of derivative of b(n) for large n
-            b = a_n_abs
-            db = sp.diff(b, n)
-            db_limit = sp.limit(db, n, sp.oo)
-            if db_limit < 0:
-                monotonic = True
-        except Exception:
-            pass
-        if monotonic is None:
-            # Fallback: evaluate b_n at a couple of large values
-            try:
-                b1 = float(a_n_abs.subs(n, 1000))
-                b2 = float(a_n_abs.subs(n, 1100))
-                if b2 < b1:
-                    monotonic = True
-            except Exception:
-                monotonic = None
-        if monotonic is None:
-            # Assume eventually decreasing if we cannot easily determine (common for well-behaved series)
-            monotonic = True
-        if monotonic:
-            # All conditions met for alternating series test:
-            return "Convergent (Conditionally convergent by Alternating Series Test)"
-        # If not monotonic, we cannot conclusively use the alternating test; continue to other tests (as a fallback).
-    
-    # 3. Geometric Series Test
-    # Check if ratio a_{n+1}/a_n is a constant (geometric series)
-    try:
-        ratio_expr = sp.simplify(a_n.subs(n, n+1) / a_n)
-    except Exception:
-        ratio_expr = None
-    if ratio_expr is not None and not ratio_expr.has(n):
-        # ratio_expr is constant
-        r_val = float(ratio_expr)
-        if abs(r_val) < 1:
-            return f"Convergent (Geometric series with |r| = {abs(r_val):.3f} < 1)"
-        else:
-            return f"Divergent (Geometric series with |r| = {abs(r_val):.3f} ≥ 1)"
-    
-    # 4. Integral Test / p-Series Test for positive term series
-    # Determine if a_n is eventually positive (for integral test applicability)
-    positive_eventually = None
-    try:
-        # Evaluate a_n for a large n to gauge sign
-        test_val = a_n.subs(n, 1000)
-        if test_val.is_real:
-            positive_eventually = (test_val > 0)
-    except Exception:
-        positive_eventually = None
-    if positive_eventually is None and not a_n.has(sp.sign) and not is_alternating:
-        # If we have no sign changes apparent and not alternating, assume it's nonnegative eventually
-        positive_eventually = True
-    
-    if positive_eventually:
-        # Try the Integral Test
-        try:
-            improper_integral = sp.integrate(a_n, (n, 1, sp.oo))
-        except Exception:
-            improper_integral = None
-        if improper_integral is sp.oo:
-            return "Divergent (by Integral Test; improper integral diverges)"
-        elif improper_integral is not None:
-            return "Convergent (by Integral Test; improper integral converges to a finite value)"
-        
-        # If integral test was inconclusive (could not integrate), try p-series via polynomial degrees
-        if a_n.is_rational_function(n):
-            num, den = a_n.as_numer_denom()
-            deg_num = sp.degree(num, n)
-            deg_den = sp.degree(den, n)
-            if deg_num is not None and deg_den is not None:
-                if deg_den - deg_num > 1:
-                    return f"Convergent (p-series comparison; effective p = {deg_den - deg_num} > 1)"
-                elif deg_den - deg_num == 1:
-                    return "Divergent (p-series comparison; effective p ≈ 1)"
-                # If deg_den - deg_num < 1, the terms do not decay fast enough (divergent by comparison to harmonic or worse),
-                # but such cases should have been caught by n-th term test if deg_den - deg_num < 0 (terms approach infinity or non-zero constant).
-    
-    # 5. Ratio Test (for absolute convergence in general)
-    try:
-        L = sp.limit(sp.Abs(a_n.subs(n, n+1) / a_n), n, sp.oo)
-    except Exception:
-        L = None
-    if L is not None:
-        if L is sp.oo:
-            return "Divergent (by Ratio Test; limit L → ∞ > 1)"
-        if L.is_real:
-            try:
-                L_val = float(L)
-            except Exception:
-                L_val = L  # could be 1 or symbolic
-            if L_val < 1:
-                return f"Convergent (by Ratio Test; L = {L_val:.3f} < 1)"
-            elif L_val > 1:
-                return f"Divergent (by Ratio Test; L = {L_val:.3f} > 1)"
-        # If L == 1 or could not be determined exactly, test is inconclusive
-    
-    # 6. Root Test
-    try:
-        R = sp.limit(sp.Abs(a_n) ** (1/n), n, sp.oo)
-    except Exception:
-        R = None
-    if R is not None:
-        if R is sp.oo:
-            return "Divergent (by Root Test; limit → ∞ > 1)"
-        if R.is_real:
-            try:
-                R_val = float(R)
-            except Exception:
-                R_val = R
-            if R_val < 1:
-                return f"Convergent (by Root Test; limit = {R_val:.3f} < 1)"
-            elif R_val > 1:
-                return f"Divergent (by Root Test; limit = {R_val:.3f} > 1)"
-        # If R == 1 or undetermined, inconclusive
-    
-    # 7. Other oscillatory cases (Dirichlet's test scenario)
-    # If a_n contains sin(n) or cos(n) factor (not purely alternating pattern), and the non-oscillatory part decays to 0
-    if (a_n.has(sp.sin) or a_n.has(sp.cos)):
-        # Check if form is sin(kn)/f(n) or cos(kn)/f(n) with f(n) -> ∞ (so that a_n -> 0)
-        # We'll assume partial sums of sin(kn) or cos(kn) are bounded (true for linear k*n arguments)
-        # So if |a_n| -> 0, we can conclude by Dirichlet's test.
-        if term_limit_value == 0 or term_limit_value is None:  # terms go to 0
-            return "Convergent (by Dirichlet's Test; oscillatory terms with decaying amplitude)"
-    
-    # 8. If none of the tests above reached a conclusion, report inconclusive
+        if term_limit.is_number and term_limit.is_real:
+            if not term_limit.is_zero:
+                return f"Divergent (n-th term -> {term_limit}, not 0)"
+
+    alt_factor, _ = _split_alternating_factor(a_n)
+    osc_factor, _ = _split_linear_oscillation(a_n)
+    has_conditional_pattern = (alt_factor is not None) or (osc_factor is not None)
+    pending_divergence = None
+
+    absolute_tests = (
+        _ratio_test,
+        _root_test,
+        _power_log_test,
+        _rational_function_test,
+        _log_order_absolute_test,
+        _limit_power_comparison,
+        _integral_test_absolute,
+    )
+
+    for test_fn in absolute_tests:
+        result = test_fn(a_n)
+        if result is None:
+            continue
+        if result.startswith("Convergent"):
+            return result
+        if not has_conditional_pattern:
+            return result
+        if pending_divergence is None:
+            pending_divergence = result
+
+    # Alternating/oscillatory conditional tests
+    result = _alternating_test(a_n)
+    if result is not None:
+        return result
+
+    result = _dirichlet_test(a_n)
+    if result is not None:
+        return result
+
+    if pending_divergence is not None:
+        return pending_divergence
+
     return "Inconclusive – unable to determine with available tests"

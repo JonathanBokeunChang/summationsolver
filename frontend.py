@@ -2,7 +2,6 @@ from flask import Flask, request
 from markupsafe import escape
 
 from backend import analyze_series
-from backend import analyze_series
 
 app = Flask(__name__)
 
