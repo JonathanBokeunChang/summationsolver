@@ -163,26 +163,20 @@ def _is_eventually_decreasing(expr, start=2):
         pass
     return None
 
+def _is_neg_one_power(expr):
+    return isinstance(expr, sp.Pow) and expr.base == -1 and expr.exp.has(n)
+
+def _is_cos_pi_factor(expr):
+    if expr.func is not sp.cos:
+        return False
+    arg = sp.simplify(expr.args[0])
+    return arg in (sp.pi * n, sp.pi * (n + 1), sp.pi * n + sp.pi)
+
 def _split_alternating_factor(expr):
-    alt_factor = None
-    for pow_expr in expr.atoms(sp.Pow):
-        if pow_expr.base == -1 and pow_expr.exp.has(n):
-            alt_factor = pow_expr
-            break
-    if alt_factor is None and expr.has(sp.cos):
-        replacements = {
-            sp.cos(sp.pi * n): (-1) ** n,
-            sp.cos(sp.pi * (n + 1)): (-1) ** (n + 1),
-            sp.cos(sp.pi * n + sp.pi): (-1) ** (n + 1),
-        }
-        expr = expr.xreplace(replacements)
-        for pow_expr in expr.atoms(sp.Pow):
-            if pow_expr.base == -1 and pow_expr.exp.has(n):
-                alt_factor = pow_expr
-                break
-    if alt_factor is None:
-        return None, expr
-    return alt_factor, sp.simplify(expr / alt_factor)
+    for factor in expr.as_ordered_factors():
+        if _is_neg_one_power(factor) or _is_cos_pi_factor(factor):
+            return factor, sp.simplify(expr / factor)
+    return None, expr
 
 def _split_linear_oscillation(expr):
     for factor in expr.as_ordered_factors():
@@ -229,7 +223,14 @@ def _leading_series_term(expr, order=4):
     return None if leading is sp.nan else leading
 
 def _power_log_test(a_n):
-    for candidate in (a_n, _leading_series_term(a_n)):
+    abs_expr = sp.simplify(sp.Abs(a_n))
+    candidates = [
+        a_n,
+        abs_expr,
+        _leading_series_term(a_n),
+        _leading_series_term(abs_expr),
+    ]
+    for candidate in candidates:
         extracted = _extract_power_log_exponents(candidate) if candidate is not None else None
         if extracted is None:
             continue
@@ -244,7 +245,11 @@ def _power_log_test(a_n):
             return "Convergent (by limit comparison to p-series; absolute)"
         if p_cmp > 0:
             return "Divergent (by limit comparison to p-series)"
-        for exponent in exponents[1:]:
+        log_exponents = exponents[1:]
+        has_log = any(exp != 0 for exp in log_exponents)
+        if not has_log:
+            return "Divergent (by limit comparison to harmonic series)"
+        for exponent in log_exponents:
             log_cmp = _compare_to_minus_one(exponent)
             if log_cmp is None:
                 break
@@ -420,11 +425,11 @@ def analyze_series(expr_str):
     absolute_tests = (
         _ratio_test,
         _root_test,
-        _power_log_test,
         _rational_function_test,
+        _power_log_test,
         _log_order_absolute_test,
-        _limit_power_comparison,
         _integral_test_absolute,
+        _limit_power_comparison,
     )
 
     for test_fn in absolute_tests:
@@ -447,7 +452,7 @@ def analyze_series(expr_str):
     if result is not None:
         return result
 
-    if pending_divergence is not None:
+    if pending_divergence is not None and not has_conditional_pattern:
         return pending_divergence
 
     return "Inconclusive – unable to determine with available tests"
